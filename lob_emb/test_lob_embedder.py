@@ -55,8 +55,10 @@ def main():
     emb, valid, aux = model.forward_with_aux(raw)
     loss = emb.square().mean() + 0.1 * aux
     loss.backward()
-    grads = [p.grad.abs().sum() for p in model.parameters() if p.grad is not None]
-    assert len(grads) > 0 and torch.stack(grads).sum() > 0
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    assert len(grads) > 0 and torch.stack([g.abs().sum() for g in grads]).sum() > 0
+    assert all(torch.isfinite(g).all() for g in grads), \
+        "NaN/Inf gradient (all-masked attention rows must stay safe)"
     assert torch.isfinite(aux), "aux loss not finite"
 
     # partial missing inside a ti (e.g. data glitch): still finite

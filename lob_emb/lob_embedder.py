@@ -45,7 +45,7 @@ EPS = 1e-6
 class LOBConfig:
     n_snaps: int = 10          # snapshots per ti
     d_level: int = 64          # token width in the book (level) encoder
-    n_level_layers: int = 2
+    n_book_queries: int = 8    # learned inducing queries pooling the book
     n_level_heads: int = 4
     d_scalar: int = 32         # width of the snapshot-scalar branch
     d_snap: int = 128          # snapshot vector width (= time encoder width)
@@ -62,24 +62,32 @@ class LOBEmbedder(nn.Module):
         self.cfg = cfg
         d, dt = cfg.d_level, cfg.d_snap
 
-        # ---- stage 1: per-snapshot book encoder (attention over 40 levels) ----
+        # ---- stage 1: per-snapshot book encoder ----
         self.level_in = nn.Sequential(
             nn.LayerNorm(N_LVL_FEAT),
             nn.Linear(N_LVL_FEAT, d),
             nn.GELU(),
             nn.Linear(d, d),
         )
-        # one positional embedding per (side, level) slot
+        # continuous positional encoding from relative price (multi-scale
+        # Fourier features of the compressed distance-to-mid), so "position"
+        # means price distance, not level rank; rank embedding is auxiliary
+        self.register_buffer("pe_freqs",
+                             torch.tensor([1.0, 2.0, 4.0, 8.0, 16.0]) * math.pi)
+        self.price_pos = nn.Linear(10, d, bias=False)
         self.side_level_pos = nn.Parameter(torch.randn(2, N_LVL, d) * 0.02)
-        self.book_cls = nn.Parameter(torch.randn(d) * 0.02)
-        self.level_encoder = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=d, nhead=cfg.n_level_heads, dim_feedforward=2 * d,
-                dropout=cfg.dropout, batch_first=True, norm_first=True,
-                activation="gelu",
-            ),
-            num_layers=cfg.n_level_layers,
-            enable_nested_tensor=False,
+
+        # inducing-point book pooling: K learned queries cross-attend over the
+        # 40 level tokens (plus one never-masked sentinel) -> K summaries
+        self.book_queries = nn.Parameter(torch.randn(cfg.n_book_queries, d) * 0.02)
+        self.null_level = nn.Parameter(torch.randn(d) * 0.02)
+        self.book_attn = nn.MultiheadAttention(
+            d, cfg.n_level_heads, dropout=cfg.dropout, batch_first=True)
+        self.book_merge = nn.Sequential(
+            nn.LayerNorm(cfg.n_book_queries * d),
+            nn.Linear(cfg.n_book_queries * d, 2 * d),
+            nn.GELU(),
+            nn.Linear(2 * d, d),
         )
 
         # ---- snapshot-scalar branch ----
@@ -233,19 +241,24 @@ class LOBEmbedder(nn.Module):
         (lvl_feats, lvl_valid, snap_scalars,
          snap_valid, fwd_ret, aux_mask) = self._build_features(x)
 
-        # ---- stage 1: book encoder over 40 level tokens per snapshot ----
+        # ---- stage 1: book pooling via K learned cross-attention queries ----
         h = self.level_in(lvl_feats)                      # [B,S,2,20,d]
-        h = h + self.side_level_pos                       # broadcast over B,S
-        tok = h.reshape(B * S, 2 * N_LVL, cfg.d_level)
-        cls = self.book_cls.expand(B * S, 1, cfg.d_level)
-        tok = torch.cat([cls, tok], dim=1)                # [B*S, 41, d]
+        rel = lvl_feats[..., 0]                           # compressed rel price
+        ang = rel.unsqueeze(-1) * self.pe_freqs           # [B,S,2,20,5]
+        pe = self.price_pos(torch.cat([ang.sin(), ang.cos()], dim=-1))
+        h = h + pe + self.side_level_pos                  # price- + rank-position
+        kv = h.reshape(B * S, 2 * N_LVL, cfg.d_level)
+        kv = torch.cat(
+            [self.null_level.expand(B * S, 1, cfg.d_level), kv], dim=1)
         pad = torch.cat(
-            [torch.zeros(B * S, 1, dtype=torch.bool, device=tok.device),
+            [torch.zeros(B * S, 1, dtype=torch.bool, device=kv.device),
              ~lvl_valid.reshape(B * S, 2 * N_LVL)],
             dim=1,
-        )
-        book_vec = self.level_encoder(tok, src_key_padding_mask=pad)[:, 0]
-        book_vec = book_vec.reshape(B, S, cfg.d_level)
+        )                                                  # sentinel never masked
+        q = self.book_queries.expand(B * S, -1, -1)
+        summ, _ = self.book_attn(q, kv, kv, key_padding_mask=pad,
+                                 need_weights=False)       # [B*S, K, d]
+        book_vec = self.book_merge(summ.flatten(1)).reshape(B, S, cfg.d_level)
 
         # ---- fuse with snapshot scalars -> snapshot vector ----
         snap = self.snap_proj(
